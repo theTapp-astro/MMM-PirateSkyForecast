@@ -217,16 +217,14 @@ Module.register("MMM-PirateSkyForecast", {
       latitude: this.config.latitude,
       longitude: this.config.longitude,
       units: this.config.units,
-      language: this.config.language,
-      instanceId: this.identifier,
-      requestDelay: this.config.requestDelay
+      language: this.config.language
     });
 
   },
 
   socketNotificationReceived: function(notification, payload) {
 
-    if (notification == "DARK_SKY_FORECAST_DATA" && payload.instanceId == this.identifier) {
+    if (notification == "DARK_SKY_FORECAST_DATA") {
 
       //clear animated icon cache
       if (this.config.useAnimatedIcons) {

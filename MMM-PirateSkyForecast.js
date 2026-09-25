@@ -303,7 +303,7 @@ Module.register("MMM-PirateSkyForecast", {
     var dailies = [];
     if (this.config.showDailyForecast) {
 
-      for (var i = 1; i <= this.config.maxDailiesToShow; i++) {
+      for (var i = 0; i <= this.config.maxDailiesToShow; i++) {
         if (this.weatherData.daily.data[i] == null) {
           break;
         }

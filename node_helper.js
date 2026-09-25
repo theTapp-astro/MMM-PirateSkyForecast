@@ -1,234 +1,178 @@
 /*********************************
- *
- * Node Helper for MMM-PirateSkyForecast
- *
- * Weather requests are centralized here so that multiple
- * instances of the module share the same API request.
- *
- * Each unique combination of API key, location, units,
- * and language is fetched at most once every 15 minutes.
- *
- *********************************/
+  Node Helper for MMM-PirateSkyForecast.
 
-var NodeHelper = require("node_helper");
-var request = require("request");
-var moment = require("moment");
+  This helper makes ONE shared API request and broadcasts
+  the result to all MMM-PirateSkyForecast instances.
+
+  Data is cached for 15 minutes.
+*********************************/
+
+const Log = require("logger");
+const NodeHelper = require("node_helper");
+const moment = require("moment");
 
 module.exports = NodeHelper.create({
 
-  // Cached weather data, keyed by request parameters.
+  // Shared cache for all instances of MMM-PirateSkyForecast
   weatherCache: {},
 
-  // Active timers, keyed by request parameters.
-  weatherTimers: {},
+  // Track requests currently in progress so multiple instances
+  // requesting at the same time don't cause multiple API calls.
+  pendingRequests: {},
 
-  // Registered module instances, keyed by request parameters.
-  subscribers: {},
-
-  CACHE_INTERVAL: 15 * 60 * 1000, // 15 minutes
-
-  start: function() {
-    console.log(
-      "====================== Starting node_helper for module [" +
-      this.name +
-      "]"
-    );
-
-    this.weatherCache = {};
-    this.weatherTimers = {};
-    this.subscribers = {};
+  start() {
+    Log.log(`Starting node_helper for module [${this.name}]`);
   },
 
-  /*
-   * Create a consistent key for a particular weather request.
-   *
-   * Instances with the same API key, location, units and language
-   * will share the same API request.
-   */
-  getCacheKey: function(payload) {
-    return [
+  socketNotificationReceived(notification, payload) {
+
+    if (notification !== "DARK_SKY_FORECAST_GET") {
+      return;
+    }
+
+    // Validate configuration
+    if (payload.apikey === null || payload.apikey === "") {
+      Log.log(
+        `[MMM-PirateSkyForecast] ${moment().format("D-MMM-YY HH:mm")} ` +
+        `** ERROR ** No API key configured.`
+      );
+      return;
+    }
+
+    if (
+      payload.latitude === null ||
+      payload.latitude === "" ||
+      payload.longitude === null ||
+      payload.longitude === ""
+    ) {
+      Log.log(
+        `[MMM-PirateSkyForecast] ${moment().format("D-MMM-YY HH:mm")} ` +
+        `** ERROR ** Latitude and/or longitude not provided.`
+      );
+      return;
+    }
+
+    /*
+     * Create a cache key based on the actual API parameters.
+     *
+     * This means that if you have multiple instances using the
+     * same location/API key/units/language, they all share one
+     * API request.
+     *
+     * If you have two different locations, they will correctly
+     * have separate cache entries.
+     */
+    const cacheKey = [
       payload.apikey,
       payload.latitude,
       payload.longitude,
       payload.units,
       payload.language
     ].join("|");
-  },
 
-  /*
-   * Register an instance of the module.
-   *
-   * If data is already cached, send it immediately.
-   * Otherwise start a polling cycle for this location.
-   */
-  registerInstance: function(payload) {
+    const now = Date.now();
+    const cacheLifetime = 15 * 60 * 1000; // 15 minutes
 
-    var self = this;
-    var cacheKey = this.getCacheKey(payload);
-
-    if (!this.subscribers[cacheKey]) {
-      this.subscribers[cacheKey] = {};
-    }
-
-    this.subscribers[cacheKey][payload.instanceId] = true;
-
-    // If we already have data, immediately send the cached data
-    // so newly started/reloaded instances don't have to wait.
-    if (this.weatherCache[cacheKey]) {
-      this.sendWeatherData(cacheKey);
-    }
-
-    // If this is the first instance using this request, start polling.
-    if (!this.weatherTimers[cacheKey]) {
-
-      // Fetch immediately.
-      this.fetchWeather(payload);
-
-      // Then fetch once every 15 minutes.
-      this.weatherTimers[cacheKey] = setInterval(function() {
-        self.fetchWeather(payload);
-      }, this.CACHE_INTERVAL);
-
-      console.log(
-        "[MMM-PirateSkyForecast] Started shared 15-minute polling for " +
-        payload.latitude + "," + payload.longitude
-      );
-    }
-  },
-
-  /*
-   * Make the actual PirateWeather API request.
-   */
-  fetchWeather: function(payload) {
-
-    var self = this;
-    var cacheKey = this.getCacheKey(payload);
-
-    if (payload.apikey == null || payload.apikey == "") {
-      console.log(
-        "[MMM-PirateSkyForecast] " +
-        moment().format("D-MMM-YY HH:mm") +
-        " ** ERROR ** No API key configured."
-      );
-      return;
-    }
-
+    /*
+     * If we have valid cached data, broadcast it without
+     * contacting Pirate Weather.
+     */
     if (
-      payload.latitude == null ||
-      payload.latitude == "" ||
-      payload.longitude == null ||
-      payload.longitude == ""
+      this.weatherCache[cacheKey] &&
+      now - this.weatherCache[cacheKey].timestamp < cacheLifetime
     ) {
-      console.log(
-        "[MMM-PirateSkyForecast] " +
-        moment().format("D-MMM-YY HH:mm") +
-        " ** ERROR ** Latitude and/or longitude not provided."
+      Log.debug(
+        `[MMM-PirateSkyForecast] Using cached weather data`
+      );
+
+      this.sendSocketNotification(
+        "DARK_SKY_FORECAST_DATA",
+        this.weatherCache[cacheKey].data
+      );
+
+      return;
+    }
+
+    /*
+     * If another instance has already started the API request,
+     * don't start another one.
+     */
+    if (this.pendingRequests[cacheKey]) {
+      Log.debug(
+        `[MMM-PirateSkyForecast] API request already in progress`
       );
       return;
     }
 
-    var url =
-      "https://api.pirateweather.net/forecast/" +
-      payload.apikey +
-      "/" +
-      payload.latitude +
-      "," +
-      payload.longitude +
-      "?units=" +
-      payload.units +
-      "&lang=" +
-      payload.language;
+    this.pendingRequests[cacheKey] = true;
 
-    console.log(
-      "[MMM-PirateSkyForecast] Fetching weather for " +
-      payload.latitude +
-      "," +
-      payload.longitude
-    );
-
-    request(
-      {
-        url: url,
-        method: "GET"
-      },
-      function(error, response, body) {
-
-        if (!error && response && response.statusCode == 200) {
-
-          try {
-
-            var resp = JSON.parse(body);
-
-            // Store the data in the shared cache.
-            self.weatherCache[cacheKey] = resp;
-
-            // Broadcast the new data to every instance.
-            self.sendWeatherData(cacheKey);
-
-            console.log(
-              "[MMM-PirateSkyForecast] Weather data updated for " +
-              payload.latitude +
-              "," +
-              payload.longitude
-            );
-
-          } catch (parseError) {
-
-            console.log(
-              "[MMM-PirateSkyForecast] " +
-              moment().format("D-MMM-YY HH:mm") +
-              " ** ERROR ** Could not parse API response: " +
-              parseError
-            );
-
-          }
-
-        } else {
-
-          console.log(
-            "[MMM-PirateSkyForecast] " +
-            moment().format("D-MMM-YY HH:mm") +
-            " ** ERROR ** " +
-            (error || ("HTTP status " +
-              (response ? response.statusCode : "unknown")))
-          );
-
-        }
-
-      }
-    );
+    this.requestData(payload, cacheKey);
   },
 
-  /*
-   * Send cached weather data to every module instance.
-   *
-   * Because sendSocketNotification broadcasts to all instances,
-   * the cacheKey is included so each instance can decide whether
-   * the data belongs to it.
-   */
-  sendWeatherData: function(cacheKey) {
+  async requestData(payload, cacheKey) {
 
-    if (!this.weatherCache[cacheKey]) {
-      return;
-    }
+    const url =
+      `https://api.pirateweather.net/forecast/` +
+      `${payload.apikey}/` +
+      `${payload.latitude},${payload.longitude}` +
+      `?units=${payload.units}` +
+      `&lang=${payload.language}`;
 
-    this.sendSocketNotification(
-      "DARK_SKY_FORECAST_DATA",
-      {
-        cacheKey: cacheKey,
-        weatherData: this.weatherCache[cacheKey]
-      }
+    Log.debug(
+      `[MMM-PirateSkyForecast] Getting data from Pirate Weather: ${url}`
     );
-  },
 
-  socketNotificationReceived: function(notification, payload) {
+    try {
 
-    if (notification === "DARK_SKY_FORECAST_REGISTER") {
+      const response = await fetch(url);
 
-      this.registerInstance(payload);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
 
+      const data = await response.json();
+
+      /*
+       * Store the response in the shared cache.
+       */
+      this.weatherCache[cacheKey] = {
+        timestamp: Date.now(),
+        data: data
+      };
+
+      Log.log(
+        `[MMM-PirateSkyForecast] Weather API request successful. ` +
+        `Broadcasting to all instances.`
+      );
+
+      /*
+       * IMPORTANT:
+       *
+       * sendSocketNotification broadcasts this notification
+       * to all instances of the module.
+       *
+       * We deliberately do NOT include/filter by instanceId.
+       */
+      this.sendSocketNotification(
+        "DARK_SKY_FORECAST_DATA",
+        data
+      );
+
+    } catch (error) {
+
+      Log.error(
+        `[MMM-PirateSkyForecast] ` +
+        `${moment().format("D-MMM-YY HH:mm")} ` +
+        `** ERROR ** ${error}`
+      );
+
+    } finally {
+
+      /*
+       * Allow another request after this one finishes.
+       */
+      delete this.pendingRequests[cacheKey];
     }
-
   }
 
 });
